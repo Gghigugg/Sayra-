@@ -1,0 +1,6 @@
+{
+  "name": "SAYRA AI",
+  "description": "Premium personal AI assistant with original holographic Digital Character presence, Liquid AI Orb, BYOK Gemini intelligence, and native Android controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
