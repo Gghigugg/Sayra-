@@ -39,20 +39,15 @@ class SpeechRecognitionManager(private val context: Context) {
 
     fun isAvailable(): Boolean = SpeechRecognizer.isRecognitionAvailable(context)
 
-    /**
-     * Starts normal one-shot recognition, or wake-word aware continuous recognition.
-     * Continuous mode is intentionally opt-in and is not a background service by itself.
-     */
+    /** Starts one-shot recognition or opt-in wake-word-aware continuous recognition. */
     fun startListening(
         languageMode: LanguageMode = LanguageMode.AUTO,
         continuousWakeWord: Boolean = false
     ) {
         stopListening()
-
         activeLanguageMode = languageMode
         continuousWakeWordMode = continuousWakeWord
         shouldKeepListening = continuousWakeWordMode
-
         _errorState.value = null
         _partialText.value = ""
         _finalResult.value = null
@@ -61,7 +56,6 @@ class SpeechRecognitionManager(private val context: Context) {
             _errorState.value = "Speech recognition is not supported on this device"
             return
         }
-
         startRecognizer()
     }
 
@@ -70,17 +64,11 @@ class SpeechRecognitionManager(private val context: Context) {
 
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
             setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {
-                    _isListening.value = true
-                }
-
-                override fun onBeginningOfSpeech() {
-                    _isListening.value = true
-                }
+                override fun onReadyForSpeech(params: Bundle?) { _isListening.value = true }
+                override fun onBeginningOfSpeech() { _isListening.value = true }
 
                 override fun onRmsChanged(rmsdB: Float) {
-                    val normalized = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
-                    _rmsLevel.value = normalized
+                    _rmsLevel.value = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
                 }
 
                 override fun onBufferReceived(buffer: ByteArray?) {}
@@ -95,7 +83,6 @@ class SpeechRecognitionManager(private val context: Context) {
                     _rmsLevel.value = 0f
 
                     if (shouldKeepListening && error != SpeechRecognizer.ERROR_CLIENT) {
-                        // Recreate the recognizer after transient recognition errors.
                         speechRecognizer?.destroy()
                         speechRecognizer = null
                         startRecognizer()
@@ -114,30 +101,24 @@ class SpeechRecognitionManager(private val context: Context) {
                         SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected"
                         else -> "Recognition error ($error)"
                     }
-                    if (msg != null && error != SpeechRecognizer.ERROR_NO_MATCH) {
-                        _errorState.value = msg
-                    }
+                    if (msg != null && error != SpeechRecognizer.ERROR_NO_MATCH) _errorState.value = msg
                 }
 
                 override fun onResults(results: Bundle?) {
                     _isListening.value = false
                     _rmsLevel.value = 0f
-
-                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    val spoken = matches?.firstOrNull()?.trim().orEmpty()
+                    val spoken = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()?.trim().orEmpty()
 
                     if (spoken.isNotEmpty()) {
                         _finalResult.value = spoken
                         _partialText.value = spoken
 
                         if (continuousWakeWordMode) {
-                            val wakeIndex = findWakeWordIndex(spoken)
-                            if (wakeIndex >= 0) {
+                            val command = extractWakeWordCommand(spoken)
+                            if (command != null) {
                                 onWakeWordDetected?.invoke()
-                                val command = spoken.substring(wakeIndex + WAKE_WORD.length).trim()
-                                if (command.isNotBlank()) {
-                                    onSpeechFinal?.invoke(command)
-                                }
+                                if (command.isNotBlank()) onSpeechFinal?.invoke(command)
                             }
                         } else {
                             onSpeechFinal?.invoke(spoken)
@@ -152,11 +133,9 @@ class SpeechRecognitionManager(private val context: Context) {
                 }
 
                 override fun onPartialResults(partialResults: Bundle?) {
-                    val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    val text = matches?.firstOrNull().orEmpty()
-                    if (text.isNotEmpty()) {
-                        _partialText.value = text
-                    }
+                    val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull().orEmpty()
+                    if (text.isNotEmpty()) _partialText.value = text
                 }
 
                 override fun onEvent(eventType: Int, params: Bundle?) {}
@@ -200,13 +179,10 @@ class SpeechRecognitionManager(private val context: Context) {
         }
     }
 
-    private fun findWakeWordIndex(spoken: String): Int {
-        val normalized = spoken.lowercase(Locale.ROOT)
-            .replace(Regex("[^a-z0-9\\s]"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-
-        return normalized.indexOf(WAKE_WORD)
+    private fun extractWakeWordCommand(spoken: String): String? {
+        val match = Regex("\\bhey[\\s,._-]*sayra\\b", RegexOption.IGNORE_CASE).find(spoken)
+            ?: return null
+        return spoken.substring(match.range.last + 1).trim()
     }
 
     fun stopListening() {
