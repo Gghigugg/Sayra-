@@ -53,7 +53,6 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
     val haptic = HapticManager(application)
     private val geminiClient = GeminiClient()
 
-    // Orb & UI States
     private val _orbState = MutableStateFlow(OrbState.IDLE)
     val orbState: StateFlow<OrbState> = _orbState.asStateFlow()
 
@@ -99,7 +98,6 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
     private val _aiModel = MutableStateFlow(prefsManager.getAiModel())
     val aiModel: StateFlow<String> = prefsManager.modelFlow
 
-    // Character presence & state controller
     val characterStateController = CharacterStateController(viewModelScope)
     val isCharacterEnabled: StateFlow<Boolean> = prefsManager.characterEnabledFlow
     val characterState: StateFlow<CharacterState> = characterStateController.characterState
@@ -124,7 +122,6 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
     )
     val characterViewMode: StateFlow<CharacterViewMode> = _characterViewMode.asStateFlow()
 
-    // Dynamic audio amplitude combining microphone RMS and TTS speaking amplitude
     val audioAmplitude: StateFlow<Float> = combine(
         speechManager.rmsLevel,
         ttsManager.speakingAmplitude,
@@ -147,7 +144,6 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Collect partial speech results live into userPrompt
         viewModelScope.launch {
             speechManager.partialText.collect { partial ->
                 if (speechManager.isListening.value && partial.isNotEmpty()) {
@@ -156,7 +152,6 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Collect speech error state
         viewModelScope.launch {
             speechManager.errorState.collect { err ->
                 if (err != null) {
@@ -172,7 +167,6 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Monitor TTS completion
         viewModelScope.launch {
             ttsManager.isSpeaking.collect { speaking ->
                 if (!speaking && _orbState.value == OrbState.SPEAKING) {
@@ -181,7 +175,6 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Synchronize Character state with OrbState and user responses
         viewModelScope.launch {
             _orbState.collect { state ->
                 characterStateController.updateFromOrbState(state, _assistantResponse.value.ifEmpty { _userPrompt.value })
@@ -200,7 +193,6 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleListening() {
         haptic.tap()
 
-        // If speaking, tapping interrupts speech immediately
         if (ttsManager.isSpeaking.value) {
             ttsManager.stop()
             _orbState.value = OrbState.IDLE
@@ -218,7 +210,10 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
             _orbState.value = OrbState.LISTENING
             audioFeedback.playListenStart()
             haptic.listenStart()
-            speechManager.startListening(prefsManager.getLanguageMode())
+            speechManager.startListening(
+                languageMode = prefsManager.getLanguageMode(),
+                continuousWakeWord = prefsManager.isWakeWordEnabled()
+            )
         }
     }
 
@@ -257,7 +252,6 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
         _orbState.value = OrbState.THINKING
 
         viewModelScope.launch {
-            // Build recent chat context from Room
             val recentList = if (!prefsManager.isPrivacyModeEnabled()) {
                 conversations.value.take(4).reversed().flatMap {
                     listOf(
@@ -267,7 +261,6 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } else emptyList()
 
-            // Fetch stored memories for context
             val rememberedFacts = if (!prefsManager.isPrivacyModeEnabled()) {
                 memoryRepository.getAllMemoriesList().map { it.fact }
             } else emptyList()
@@ -281,18 +274,14 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
             )
 
             when (result) {
-                is GeminiResult.Success -> {
-                    handleGeminiSuccess(prompt, result.text, result.toolCall)
-                }
+                is GeminiResult.Success -> handleGeminiSuccess(prompt, result.text, result.toolCall)
                 is GeminiResult.Error -> {
                     _orbState.value = OrbState.ERROR
                     audioFeedback.playError()
                     haptic.error()
                     val errText = if (result.isAuthError) {
                         "Your Gemini API key could not be verified. Please check your key in Settings and try again."
-                    } else {
-                        result.message
-                    }
+                    } else result.message
                     _assistantResponse.value = errText
                     ttsManager.speak(errText)
                     if (!prefsManager.isPrivacyModeEnabled()) {
@@ -311,12 +300,10 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
         var actionResult: ToolExecutionInfo? = null
 
         if (toolCall != null) {
-            // Sensitive actions check: phone call with confirmation
             if (toolCall.name == "makePhoneCall" && prefsManager.isConfirmSensitiveEnabled()) {
                 val phone = toolCall.args["phoneNumber"]?.toString() ?: ""
                 val contact = toolCall.args["contactName"]?.toString()
                 val targetName = if (!contact.isNullOrBlank()) contact else phone
-
                 _actionConfirmation.value = ActionConfirmation(
                     title = "Confirm Phone Call",
                     description = "Do you want SAYRA to call $targetName ($phone)?",
@@ -336,12 +323,10 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
-            // Sensitive action check: SMS compose with confirmation
             if (toolCall.name == "composeSms" && prefsManager.isConfirmSensitiveEnabled()) {
                 val phone = toolCall.args["phoneNumber"]?.toString().orEmpty()
                 val msg = toolCall.args["message"]?.toString().orEmpty()
                 val target = if (phone.isNotBlank()) phone else "recipient"
-
                 _actionConfirmation.value = ActionConfirmation(
                     title = "Confirm Message",
                     description = "Do you want SAYRA to open SMS for $target with message: \"$msg\"?",
@@ -361,10 +346,8 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
-            // Execute modular Android or Memory tool
             actionResult = executeTool(toolCall)
             _toolExecution.value = actionResult
-
             if (actionResult.isSuccess) {
                 _orbState.value = OrbState.ACTION_SUCCESS
                 audioFeedback.playSuccess()
@@ -378,21 +361,13 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        val speechText = if (responseText.isNotBlank()) responseText
-        else actionResult?.details ?: "Done."
-
+        val speechText = if (responseText.isNotBlank()) responseText else actionResult?.details ?: "Done."
         _assistantResponse.value = speechText
         _orbState.value = OrbState.SPEAKING
         ttsManager.speak(speechText)
 
-        // Save conversation only if privacy mode is NOT active
         if (!prefsManager.isPrivacyModeEnabled()) {
-            repository.saveConversation(
-                userQuery = prompt,
-                assistantResponse = speechText,
-                actionExecuted = actionResult?.displayName,
-                isSuccess = actionResult?.isSuccess ?: true
-            )
+            repository.saveConversation(prompt, speechText, actionResult?.displayName, actionResult?.isSuccess ?: true)
         }
     }
 
@@ -401,12 +376,10 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
         _orbState.value = OrbState.ACTION_SUCCESS
         audioFeedback.playSuccess()
         haptic.actionSuccess()
-
         val speechText = if (responseText.isNotBlank()) responseText else exec.details
         _assistantResponse.value = speechText
         _orbState.value = OrbState.SPEAKING
         ttsManager.speak(speechText)
-
         if (!prefsManager.isPrivacyModeEnabled()) {
             viewModelScope.launch {
                 repository.saveConversation(prompt, speechText, exec.displayName, exec.isSuccess)
@@ -416,34 +389,17 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun executeTool(toolCall: GeminiToolCall): ToolExecutionInfo {
         return when (toolCall.name) {
-            "openApp" -> {
-                val appName = toolCall.args["appName"]?.toString() ?: "App"
-                actionController.openApp(appName)
-            }
-            "openSettings" -> {
-                val type = toolCall.args["settingType"]?.toString() ?: "settings"
-                actionController.openSettings(type)
-            }
-            "getBatteryStatus" -> {
-                actionController.getBatteryStatus()
-            }
-            "controlFlashlight" -> {
-                val on = (toolCall.args["turnOn"] as? Boolean) ?: true
-                actionController.controlFlashlight(on)
-            }
+            "openApp" -> actionController.openApp(toolCall.args["appName"]?.toString() ?: "App")
+            "openSettings" -> actionController.openSettings(toolCall.args["settingType"]?.toString() ?: "settings")
+            "getBatteryStatus" -> actionController.getBatteryStatus()
+            "controlFlashlight" -> actionController.controlFlashlight((toolCall.args["turnOn"] as? Boolean) ?: true)
             "controlVolume" -> {
                 val dir = toolCall.args["direction"]?.toString() ?: "up"
                 val level = (toolCall.args["level"] as? Number)?.toInt()
                 actionController.controlVolume(dir, level)
             }
-            "controlBrightness" -> {
-                val level = (toolCall.args["levelPercent"] as? Number)?.toInt() ?: 50
-                actionController.controlBrightness(level)
-            }
-            "openUrl" -> {
-                val url = toolCall.args["url"]?.toString() ?: "https://google.com"
-                actionController.openUrl(url)
-            }
+            "controlBrightness" -> actionController.controlBrightness((toolCall.args["levelPercent"] as? Number)?.toInt() ?: 50)
+            "openUrl" -> actionController.openUrl(toolCall.args["url"]?.toString() ?: "https://google.com")
             "saveMemory" -> {
                 if (prefsManager.isPrivacyModeEnabled()) {
                     ToolExecutionInfo("saveMemory", "Privacy Mode Active", "Privacy Mode is currently on. SAYRA will not store new memories.", false, "privacy")
@@ -453,56 +409,33 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
                     if (fact.isNotBlank()) {
                         memoryRepository.saveMemory(fact, category)
                         ToolExecutionInfo("saveMemory", "Memory Saved", "Remembered: \"$fact\"", true, "memory")
-                    } else {
-                        ToolExecutionInfo("saveMemory", "Memory", "No fact provided to remember", false, "memory")
-                    }
+                    } else ToolExecutionInfo("saveMemory", "Memory", "No fact provided to remember", false, "memory")
                 }
             }
             "recallMemory" -> {
                 val current = memoryRepository.getAllMemoriesList()
-                if (current.isEmpty()) {
-                    ToolExecutionInfo("recallMemory", "Memories", "I don't have any saved memories yet.", true, "memory")
-                } else {
-                    val summary = current.joinToString("; ") { it.fact }
-                    ToolExecutionInfo("recallMemory", "Memories (${current.size})", "Here is what I remember: $summary", true, "memory")
-                }
+                if (current.isEmpty()) ToolExecutionInfo("recallMemory", "Memories", "I don't have any saved memories yet.", true, "memory")
+                else ToolExecutionInfo("recallMemory", "Memories (${current.size})", "Here is what I remember: ${current.joinToString("; ") { it.fact }}", true, "memory")
             }
-            "makePhoneCall" -> {
-                val phone = toolCall.args["phoneNumber"]?.toString() ?: ""
-                val contact = toolCall.args["contactName"]?.toString()
-                actionController.makePhoneCall(phone, contact)
-            }
-            "composeSms" -> {
-                val phone = toolCall.args["phoneNumber"]?.toString()
-                val msg = toolCall.args["message"]?.toString() ?: ""
-                actionController.composeSms(phone, msg)
-            }
-            "createReminder" -> {
-                val title = toolCall.args["title"]?.toString() ?: "Reminder"
-                val time = toolCall.args["time"]?.toString() ?: "today"
-                actionController.createReminder(title, time)
-            }
-            "searchWeb" -> {
-                val query = toolCall.args["query"]?.toString() ?: ""
-                actionController.searchWeb(query)
-            }
-            "getDeviceInfo" -> {
-                actionController.getDeviceInfo()
-            }
-            else -> {
-                ToolExecutionInfo(toolCall.name, "Action", "Executed ${toolCall.name}", true)
-            }
+            "makePhoneCall" -> actionController.makePhoneCall(
+                toolCall.args["phoneNumber"]?.toString() ?: "",
+                toolCall.args["contactName"]?.toString()
+            )
+            "composeSms" -> actionController.composeSms(toolCall.args["phoneNumber"]?.toString(), toolCall.args["message"]?.toString() ?: "")
+            "createReminder" -> actionController.createReminder(
+                toolCall.args["title"]?.toString() ?: "Reminder",
+                toolCall.args["time"]?.toString() ?: "today"
+            )
+            "searchWeb" -> actionController.searchWeb(toolCall.args["query"]?.toString() ?: "")
+            "getDeviceInfo" -> actionController.getDeviceInfo()
+            else -> ToolExecutionInfo(toolCall.name, "Action", "Executed ${toolCall.name}", true)
         }
     }
 
-    // Settings actions
     fun testApiKey(key: String, onResult: (Boolean, String) -> Unit) {
         viewModelScope.launch {
             val res = geminiClient.testConnection(key, _aiModel.value)
-            res.fold(
-                onSuccess = { onResult(true, it) },
-                onFailure = { onResult(false, it.message ?: "Connection test failed") }
-            )
+            res.fold({ onResult(true, it) }, { onResult(false, it.message ?: "Connection test failed") })
         }
     }
 
@@ -524,30 +457,21 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
         ttsManager.updateSettings(rate, pitch)
     }
 
-    fun updateLanguageMode(mode: LanguageMode) {
-        prefsManager.setLanguageMode(mode)
-    }
-
+    fun updateLanguageMode(mode: LanguageMode) = prefsManager.setLanguageMode(mode)
     fun updateAiModel(model: String) {
         _aiModel.value = model
         prefsManager.setAiModel(model)
     }
-
     fun updateOrbIntensity(intensity: Float) {
         _orbIntensity.value = intensity
         prefsManager.setOrbIntensity(intensity)
     }
-
-    fun updateDarkTheme(dark: Boolean) {
-        prefsManager.setDarkTheme(dark)
-    }
-
+    fun updateDarkTheme(dark: Boolean) = prefsManager.setDarkTheme(dark)
     fun updatePrivacyMode(enabled: Boolean) {
         prefsManager.setPrivacyModeEnabled(enabled)
         haptic.tap()
     }
 
-    // Character Controls
     fun toggleCharacterViewMode() {
         val next = if (_characterViewMode.value == CharacterViewMode.CHARACTER) CharacterViewMode.ORB else CharacterViewMode.CHARACTER
         _characterViewMode.value = next
@@ -555,22 +479,23 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
         characterStateController.setViewMode(next)
         haptic.tap()
     }
-
     fun updateCharacterEnabled(enabled: Boolean) {
         prefsManager.setCharacterEnabled(enabled)
         haptic.tap()
     }
-
     fun updateCharacterPerformanceMode(mode: CharacterPerformanceMode) {
         _characterPerformanceMode.value = mode
         prefsManager.setCharacterPerformance(mode.name)
         characterStateController.setPerformanceMode(mode)
         haptic.tap()
     }
-
     fun updateWakeWord(enabled: Boolean) {
         prefsManager.setWakeWordEnabled(enabled)
         haptic.tap()
+        if (!enabled) {
+            speechManager.stopListening()
+            if (_orbState.value == OrbState.LISTENING) _orbState.value = OrbState.IDLE
+        }
     }
 
     fun completeOnboarding() {
@@ -578,45 +503,35 @@ class SayraViewModel(application: Application) : AndroidViewModel(application) {
         haptic.actionSuccess()
     }
 
-    // Memory actions
     fun saveUserMemory(fact: String, category: String = "general") {
         viewModelScope.launch {
             memoryRepository.saveMemory(fact, category)
             haptic.actionSuccess()
         }
     }
-
     fun updateUserMemory(id: Long, fact: String, category: String = "general") {
         viewModelScope.launch {
             memoryRepository.updateMemory(id, fact, category)
             haptic.tap()
         }
     }
-
     fun deleteUserMemory(id: Long) {
         viewModelScope.launch {
             memoryRepository.deleteMemory(id)
             haptic.tap()
         }
     }
-
     fun clearAllUserMemories() {
         viewModelScope.launch {
             memoryRepository.clearAllMemories()
             haptic.actionSuccess()
         }
     }
-
     fun deleteConversation(id: Long) {
-        viewModelScope.launch {
-            repository.deleteById(id)
-        }
+        viewModelScope.launch { repository.deleteById(id) }
     }
-
     fun clearAllConversations() {
-        viewModelScope.launch {
-            repository.clearHistory()
-        }
+        viewModelScope.launch { repository.clearHistory() }
     }
 
     override fun onCleared() {
