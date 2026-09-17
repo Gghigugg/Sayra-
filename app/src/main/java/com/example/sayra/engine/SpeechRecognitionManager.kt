@@ -15,6 +15,9 @@ import java.util.Locale
 class SpeechRecognitionManager(private val context: Context) {
 
     private var speechRecognizer: SpeechRecognizer? = null
+    private var activeLanguageMode = LanguageMode.AUTO
+    private var continuousWakeWordMode = false
+    private var shouldKeepListening = false
 
     private val _isListening = MutableStateFlow(false)
     val isListening: StateFlow<Boolean> = _isListening.asStateFlow()
@@ -32,13 +35,23 @@ class SpeechRecognitionManager(private val context: Context) {
     val errorState: StateFlow<String?> = _errorState.asStateFlow()
 
     var onSpeechFinal: ((String) -> Unit)? = null
+    var onWakeWordDetected: (() -> Unit)? = null
 
-    fun isAvailable(): Boolean {
-        return SpeechRecognizer.isRecognitionAvailable(context)
-    }
+    fun isAvailable(): Boolean = SpeechRecognizer.isRecognitionAvailable(context)
 
-    fun startListening(languageMode: LanguageMode = LanguageMode.AUTO) {
+    /**
+     * Starts normal one-shot recognition, or wake-word aware continuous recognition.
+     * Continuous mode is intentionally opt-in and is not a background service by itself.
+     */
+    fun startListening(
+        languageMode: LanguageMode = LanguageMode.AUTO,
+        continuousWakeWord: Boolean = false
+    ) {
         stopListening()
+
+        activeLanguageMode = languageMode
+        continuousWakeWordMode = continuousWakeWord
+        shouldKeepListening = continuousWakeWordMode
 
         _errorState.value = null
         _partialText.value = ""
@@ -48,6 +61,12 @@ class SpeechRecognitionManager(private val context: Context) {
             _errorState.value = "Speech recognition is not supported on this device"
             return
         }
+
+        startRecognizer()
+    }
+
+    private fun startRecognizer() {
+        if (!shouldKeepListening && speechRecognizer != null) return
 
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
             setRecognitionListener(object : RecognitionListener {
@@ -60,7 +79,6 @@ class SpeechRecognitionManager(private val context: Context) {
                 }
 
                 override fun onRmsChanged(rmsdB: Float) {
-                    // rmsdB is typically -2f to 10f; normalize between 0f and 1f
                     val normalized = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
                     _rmsLevel.value = normalized
                 }
@@ -75,9 +93,18 @@ class SpeechRecognitionManager(private val context: Context) {
                 override fun onError(error: Int) {
                     _isListening.value = false
                     _rmsLevel.value = 0f
+
+                    if (shouldKeepListening && error != SpeechRecognizer.ERROR_CLIENT) {
+                        // Recreate the recognizer after transient recognition errors.
+                        speechRecognizer?.destroy()
+                        speechRecognizer = null
+                        startRecognizer()
+                        return
+                    }
+
                     val msg = when (error) {
                         SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
-                        SpeechRecognizer.ERROR_CLIENT -> null // Cancelled by client
+                        SpeechRecognizer.ERROR_CLIENT -> null
                         SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission required"
                         SpeechRecognizer.ERROR_NETWORK -> "Network error during speech recognition"
                         SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timed out"
@@ -95,18 +122,38 @@ class SpeechRecognitionManager(private val context: Context) {
                 override fun onResults(results: Bundle?) {
                     _isListening.value = false
                     _rmsLevel.value = 0f
+
                     val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    val spoken = matches?.firstOrNull()?.trim() ?: ""
+                    val spoken = matches?.firstOrNull()?.trim().orEmpty()
+
                     if (spoken.isNotEmpty()) {
                         _finalResult.value = spoken
                         _partialText.value = spoken
-                        onSpeechFinal?.invoke(spoken)
+
+                        if (continuousWakeWordMode) {
+                            val wakeIndex = findWakeWordIndex(spoken)
+                            if (wakeIndex >= 0) {
+                                onWakeWordDetected?.invoke()
+                                val command = spoken.substring(wakeIndex + WAKE_WORD.length).trim()
+                                if (command.isNotBlank()) {
+                                    onSpeechFinal?.invoke(command)
+                                }
+                            }
+                        } else {
+                            onSpeechFinal?.invoke(spoken)
+                        }
+                    }
+
+                    if (shouldKeepListening) {
+                        speechRecognizer?.destroy()
+                        speechRecognizer = null
+                        startRecognizer()
                     }
                 }
 
                 override fun onPartialResults(partialResults: Bundle?) {
                     val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    val text = matches?.firstOrNull() ?: ""
+                    val text = matches?.firstOrNull().orEmpty()
                     if (text.isNotEmpty()) {
                         _partialText.value = text
                     }
@@ -120,8 +167,9 @@ class SpeechRecognitionManager(private val context: Context) {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
 
-            when (languageMode) {
+            when (activeLanguageMode) {
                 LanguageMode.HINDI -> {
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "hi-IN")
@@ -131,9 +179,11 @@ class SpeechRecognitionManager(private val context: Context) {
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-US")
                 }
                 LanguageMode.HINGLISH, LanguageMode.AUTO -> {
-                    // Multi-lingual support
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
-                    putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("hi-IN", "en-US", "en-IN"))
+                    putExtra(
+                        "android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES",
+                        arrayOf("hi-IN", "en-US", "en-IN")
+                    )
                 }
             }
         }
@@ -143,16 +193,36 @@ class SpeechRecognitionManager(private val context: Context) {
         } catch (e: Exception) {
             _errorState.value = "Failed to start listening: ${e.message}"
             _isListening.value = false
+            if (shouldKeepListening) {
+                speechRecognizer?.destroy()
+                speechRecognizer = null
+            }
         }
     }
 
+    private fun findWakeWordIndex(spoken: String): Int {
+        val normalized = spoken.lowercase(Locale.ROOT)
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        return normalized.indexOf(WAKE_WORD)
+    }
+
     fun stopListening() {
+        shouldKeepListening = false
+        continuousWakeWordMode = false
         try {
             speechRecognizer?.stopListening()
+            speechRecognizer?.cancel()
             speechRecognizer?.destroy()
         } catch (_: Exception) {}
         speechRecognizer = null
         _isListening.value = false
         _rmsLevel.value = 0f
+    }
+
+    companion object {
+        private const val WAKE_WORD = "hey sayra"
     }
 }
